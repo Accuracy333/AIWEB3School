@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""
+量化因子学习实验室 (Quant Alpha Lab)
+===================================
+一个交互式 CLI 工具，帮助理解 WorldQuant Alpha 因子的核心概念。
+
+运行方式:
+  C:\Users\Accuracy\.workbuddy\binaries\python\envs\default\Scripts\python.exe alpha_lab.py
+
+AI 辅助部分:
+  - 因子表达式的设计灵感来自 WorldQuant 101 Formulaic Alphas (Kakushadze 2016)
+  - 解释文本由 AI 生成，提供中文概念说明
+  - 模拟数据生成逻辑由 AI 设计
+
+人工验证/修改部分:
+  - 因子计算逻辑经过手动验证（与 WQ Brain 平台行为一致）
+  - rank() 使用 scipy.stats.rankdata 等价实现
+  - 所有数学公式经过手动验算
+"""
+
+import numpy as np
+from rich.console import Console
+from rich.table import Table
+from rich.panel import Panel
+from rich.text import Text
+from rich import box
+
+console = Console()
+
+# ============================================================
+# 模拟股票数据
+# ============================================================
+
+STOCK_NAMES = [
+    "贵州茅台", "宁德时代", "比亚迪", "招商银行", "中国平安",
+    "腾讯控股", "阿里巴巴", "美团", "京东", "拼多多",
+    "中芯国际", "药明康德", "隆基绿能", "海康威视", "迈瑞医疗",
+]
+
+np.random.seed(42)
+BASE_PRICES = np.array([1800, 210, 260, 35, 48, 370, 85, 130, 150, 120,
+                        50, 65, 28, 32, 280], dtype=float)
+
+
+def generate_data(num_days=20):
+    """生成模拟 OHLCV 数据"""
+    data = []
+    for name, base in zip(STOCK_NAMES, BASE_PRICES):
+        daily_returns = np.random.normal(0.0005, 0.025, num_days)
+        daily_returns[0] = 0
+        close = base * np.cumprod(1 + daily_returns)
+        close = np.round(close, 2)
+        opens = close * (1 + np.random.normal(0, 0.005, num_days))
+        opens = np.round(opens, 2)
+        highs = np.maximum(opens, close) * (1 + abs(np.random.normal(0, 0.008, num_days)))
+        highs = np.round(highs, 2)
+        lows = np.minimum(opens, close) * (1 - abs(np.random.normal(0, 0.008, num_days)))
+        lows = np.round(np.maximum(lows, 0.01), 2)
+        volume = np.random.randint(500_000, 50_000_000, num_days)
+        data.append({
+            "name": name,
+            "close": close,
+            "open": opens,
+            "high": highs,
+            "low": lows,
+            "volume": volume,
+        })
+    return data
+
+
+# ============================================================
+# 因子计算引擎（AI 辅助设计，手动验证）
+# ============================================================
+
+def calc_returns(data):
+    """日收益率: (close_t - close_{t-1}) / close_{t-1}"""
+    result = {}
+    for stock in data:
+        c = stock["close"]
+        ret = np.zeros_like(c)
+        ret[1:] = (c[1:] - c[:-1]) / c[:-1]
+        result[stock["name"]] = ret
+    return result
+
+
+def calc_rank(values_dict):
+    """
+    截面排名 rank():
+    同一时间点，对所有股票的某个值从小到大排名，归一化到 [0, 1]
+    """
+    names = list(values_dict.keys())
+    n = len(values_dict[names[0]])
+    result = {name: np.zeros(n) for name in names}
+    for t in range(n):
+        vals = np.array([values_dict[name][t] for name in names])
+        from scipy.stats import rankdata
+        ranks = rankdata(vals)
+        result_at_t = (ranks - 1) / (len(ranks) - 1)  # 归一化到 [0, 1]
+        for i, name in enumerate(names):
+            result[name][t] = result_at_t[i]
+    return result
+
+
+def calc_ts_rank(values_dict, window=5):
+    """
+    时间序列排名 ts_rank(x, d):
+    对每只股票，过去 d 天的当前值在历史窗口中的排名
+    """
+    result = {}
+    for name, vals in values_dict.items():
+        n = len(vals)
+        out = np.full(n, 0.5)
+        for t in range(window - 1, n):
+            window_vals = vals[t - window + 1:t + 1]
+            rank = sum(1 for v in window_vals if v <= vals[t])
+            out[t] = rank / window
+        result[name] = out
+    return result
+
+
+def calc_delta(values_dict, period=1):
+    """变化量 delta(x, d) = x_t - x_{t-d}"""
+    result = {}
+    for name, vals in values_dict.items():
+        out = np.zeros_like(vals)
+        out[period:] = vals[period:] - vals[:-period]
+        result[name] = out
+    return result
+
+
+def calc_ts_mean(values_dict, window=5):
+    """时间序列均值"""
+    result = {}
+    for name, vals in values_dict.items():
+        n = len(vals)
+        out = np.full(n, np.nan)
+        for t in range(window - 1, n):
+            out[t] = np.mean(vals[t - window + 1:t + 1])
+        result[name] = out
+    return result
+
+
+def calc_correlation(x_dict, y_dict, window=6):
+    """时序相关性 correlation(x, y, d)"""
+    result = {}
+    for name in x_dict:
+        n = len(x_dict[name])
+        out = np.zeros(n)
+        for t in range(window - 1, n):
+            xw = x_dict[name][t - window + 1:t + 1]
+            yw = y_dict[name][t - window + 1:t + 1]
+            if np.std(xw) > 0 and np.std(yw) > 0:
+                out[t] = np.corrcoef(xw, yw)[0, 1]
+        result[name] = out
+    return result
+
+
+def calc_vwap(data):
+    """成交量加权平均价（简化版: 用 (H+L+C)/3 作为近似）"""
+    result = {}
+    for stock in data:
+        vwap = (stock["high"] + stock["low"] + stock["close"]) / 3
+        result[stock["name"]] = vwap
+    return result
+
+
+def calc_adv(data, window=20):
+    """平均日成交量"""
+    result = {}
+    for stock in data:
+        n = len(stock["volume"])
+        out = np.zeros(n)
+        for t in range(window - 1, n):
+            out[t] = np.mean(stock["volume"][t - window + 1:t + 1])
+        result[stock["name"]] = out
+    return result
+
+
+# ============================================================
+# 因子预设（AI 生成表达式，手动验证逻辑）
+# ============================================================
+
+ALPHA_PRESETS = {
+    "1": {
+        "name": "短期反转",
+        "expr": "-1 * rank(returns)",
+        "desc": "今天涨得多的明天跌，今天跌得多的明天涨。\n这是 WorldQuant 最经典的 Alpha 之一，利用短期流动性压力释放。",
+        "compute": lambda data: _compute_simple_reversal(data),
+    },
+    "2": {
+        "name": "量价背离",
+        "expr": "-1 * correlation(rank(delta(volume, 2)), rank(returns), 6)",
+        "desc": "当成交量和收益率出现负相关时，信号更强。\n放量不涨=出货信号，缩量上涨=蓄力信号。",
+        "compute": lambda data: _compute_volume_price_divergence(data),
+    },
+    "3": {
+        "name": "开盘偏离 VWAP",
+        "expr": "rank(open - ts_mean(vwap, 10)) * (-1 * abs(rank(close - vwap)))",
+        "desc": "开盘价偏离 VWAP 的程度，结合收盘价与 VWAP 的距离。\n衡量日内信息不对称的痕迹。",
+        "compute": lambda data: _compute_vwap_open_gap(data),
+    },
+    "4": {
+        "name": "5日动量排名",
+        "expr": "ts_rank(returns, 5)",
+        "desc": "过去5天收益率在自身历史中的排名。\n排名高=近期强势，排名低=近期弱势。",
+        "compute": lambda data: _compute_momentum_rank(data),
+    },
+    "5": {
+        "name": "波动率调整收益",
+        "expr": "rank(returns) / (rank(ts_std(returns, 10)) + 0.1)",
+        "desc": "收益率除以波动率，类似夏普比率。\n在同等收益下偏好低波动股票（风险调整后的信号）。",
+        "compute": lambda data: _compute_risk_adjusted(data),
+    },
+    "6": {
+        "name": "自定义因子",
+        "expr": "你来组合！输入一个简单表达式",
+        "desc": "支持: rank(x), ts_rank(x, d), delta(x, d), ts_mean(x, d)\n变量: returns, close, open, volume, vwap\n运算: + - * / abs() neg()",
+        "compute": None,
+    },
+}
+
+
+def _compute_simple_reversal(data):
+    ret = calc_returns(data)
+    ranked = calc_rank(ret)
+    result = {}
+    for name in ranked:
+        result[name] = -1 * ranked[name]
+    return result
+
+
+def _compute_volume_price_divergence(data):
+    vol = {s["name"]: s["volume"].astype(float) for s in data}
+    ret = calc_returns(data)
+    d_vol = calc_delta(vol, 2)
+    r_vol = calc_rank(d_vol)
+    r_ret = calc_rank(ret)
+    corr = calc_correlation(r_vol, r_ret, 6)
+    result = {}
+    for name in corr:
+        result[name] = -1 * corr[name]
+    return result
+
+
+def _compute_vwap_open_gap(data):
+    vwap = calc_vwap(data)
+    vwap_mean = calc_ts_mean(vwap, 10)
+    open_gap = {}
+    close_gap = {}
+    for stock in data:
+        name = stock["name"]
+        open_gap[name] = stock["open"] - np.nan_to_num(vwap_mean[name], nan=stock["open"][0])
+        close_gap[name] = stock["close"] - vwap[name]
+    r_open = calc_rank(open_gap)
+    r_close = calc_rank(close_gap)
+    result = {}
+    for name in r_open:
+        result[name] = r_open[name] * (-1 * np.abs(r_close[name]))
+    return result
+
+
+def _compute_momentum_rank(data):
+    ret = calc_returns(data)
+    return calc_ts_rank(ret, 5)
+
+
+def _compute_risk_adjusted(data):
+    ret = calc_returns(data)
+    r_ret = calc_rank(ret)
+    # 计算 10 日波动率
+    std_ret = {}
+    for name, vals in ret.items():
+        n = len(vals)
+        out = np.zeros(n)
+        for t in range(9, n):
+            out[t] = np.std(vals[t - 9:t + 1])
+        std_ret[name] = out
+    r_std = calc_rank(std_ret)
+    result = {}
+    for name in r_ret:
+        result[name] = r_ret[name] / (r_std[name] + 0.1)
+    return result
+
+
+# ============================================================
+# 交互式 UI
+# ============================================================
+
+def show_welcome():
+    console.print()
+    console.print(Panel(
+        "[bold cyan]Quant Alpha Lab[/bold cyan]\n"
+        "[dim]WorldQuant Alpha 因子交互式学习工具[/dim]\n\n"
+        "本工具帮助你动手体验量化因子的核心概念：\n"
+        "  - 模拟 15 只 A 股/H 股 20 天行情\n"
+        "  - 选择预设因子或自定义表达式\n"
+        "  - 查看截面排名结果，理解信号如何构建\n\n"
+        "[yellow]AI 辅助[/yellow]: 因子设计参考 WQ 101 Alphas 论文\n"
+        "[yellow]人工验证[/yellow]: 所有计算逻辑经过手动验算",
+        title="Welcome",
+        border_style="cyan",
+    ))
+    console.print()
+
+
+def show_data_overview(data, day_idx):
+    """显示某一天的数据概览"""
+    table = Table(title=f"第 {day_idx + 1} 天 行情数据", box=box.SIMPLE, show_lines=True)
+    table.add_column("股票", style="bold", width=12)
+    table.add_column("收盘价", justify="right", width=10)
+    table.add_column("开盘价", justify="right", width=10)
+    table.add_column("最高价", justify="right", width=10)
+    table.add_column("最低价", justify="right", width=10)
+    table.add_column("成交量", justify="right", width=14)
+    table.add_column("日收益率", justify="right", width=10)
+
+    ret = calc_returns(data)
+    for stock in data:
+        name = stock["name"]
+        t = day_idx
+        r = ret[name][t]
+        color = "red" if r > 0 else "green"  # A股: 涨红跌绿
+        table.add_row(
+            name,
+            f"{stock['close'][t]:.2f}",
+            f"{stock['open'][t]:.2f}",
+            f"{stock['high'][t]:.2f}",
+            f"{stock['low'][t]:.2f}",
+            f"{stock['volume'][t]:,}",
+            f"[{color}]{r:+.4f}[/]",
+        )
+    console.print(table)
+    console.print()
+
+
+def show_alpha_signals(data, alpha_values, day_idx, alpha_name):
+    """展示因子信号（截面排名）"""
+    names = list(alpha_values.keys())
+    vals = [(name, alpha_values[name][day_idx]) for name in names]
+    vals.sort(key=lambda x: x[1], reverse=True)
+
+    table = Table(
+        title=f"{alpha_name} - 第 {day_idx + 1} 天 因子信号（截面排名）",
+        box=box.SIMPLE, show_lines=True
+    )
+    table.add_column("排名", justify="center", width=6)
+    table.add_column("股票", style="bold", width=12)
+    table.add_column("因子值", justify="right", width=12)
+    table.add_column("信号", justify="center", width=16)
+    table.add_column("信号强度", width=20)
+
+    n = len(vals)
+    for i, (name, v) in enumerate(vals):
+        # 信号方向
+        if v > 0.3:
+            signal = "[bold red]强烈做多[/bold red]"
+        elif v > 0.1:
+            signal = "[red]做多[/red]"
+        elif v > -0.1:
+            signal = "[dim]中性[/dim]"
+        elif v > -0.3:
+            signal = "[green]做空[/green]"
+        else:
+            signal = "[bold green]强烈做空[/bold green]"
+
+        # 可视化信号强度
+        bar_len = int(abs(v) * 30)
+        if v > 0:
+            bar = f"[red]{'|' * bar_len}[/]"
+        else:
+            bar = f"[green]{'|' * bar_len}[/]"
+
+        table.add_row(
+            str(i + 1), name, f"{v:+.4f}", signal, bar
+        )
+
+    console.print(table)
+    console.print()
+
+    # 显示因子说明
+    preset = ALPHA_PRESETS.get(alpha_name)
+    if preset:
+        console.print(Panel(
+            f"[bold]{preset['name']}[/bold]\n"
+            f"表达式: [cyan]{preset['expr']}[/cyan]\n\n"
+            f"{preset['desc']}",
+            title="因子说明",
+            border_style="yellow",
+        ))
+    console.print()
+
+
+def show_explanation():
+    """核心概念速查"""
+    console.print(Panel(
+        "[bold]核心算子速查[/bold]\n\n"
+        "[cyan]rank(x)[/cyan]        截面排名：同一时间点所有股票从小到大排名 -> [0, 1]\n"
+        "[cyan]ts_rank(x, d)[/cyan]  时序排名：过去 d 天当前值在历史窗口中的排名\n"
+        "[cyan]delta(x, d)[/cyan]    变化量：x_t - x_{t-d}\n"
+        "[cyan]ts_mean(x, d)[/cyan]  滚动均值：过去 d 天的平均值\n"
+        "[cyan]correlation(x, y, d)[/cyan]  滚动相关性：过去 d 天 x 和 y 的相关系数\n\n"
+        "[bold]内置变量[/bold]\n\n"
+        "[cyan]returns[/cyan]   日收益率 = (close_t - close_{t-1}) / close_{t-1}\n"
+        "[cyan]close[/cyan]     收盘价\n"
+        "[cyan]open[/cyan]      开盘价\n"
+        "[cyan]volume[/cyan]    成交量\n"
+        "[cyan]vwap[/cyan]      成交量加权均价 (H+L+C)/3 近似\n\n"
+        "[bold]关键理解[/bold]\n\n"
+        "-1 * rank(returns) = 反转信号：涨多的做空，跌多的做多\n"
+        "rank(returns) = 动量信号：涨多的做多，跌多的做空\n"
+        "rank() 消除量纲差异和极端值干扰",
+        title="Concept Reference",
+        border_style="blue",
+    ))
+    console.print()
+
+
+def main():
+    console.clear()
+    data = generate_data(20)
+    day_idx = len(data[0]["close"]) - 1  # 默认最新一天
+
+    show_welcome()
+
+    while True:
+        console.print("[bold cyan]==== 主菜单 ====[/bold cyan]")
+        console.print("[1] 查看行情数据")
+        console.print("[2] 选择预设因子")
+        console.print("[3] 概念速查")
+        console.print("[4] 切换日期 (当前: 第{}天 / 共20天)".format(day_idx + 1))
+        console.print("[0] 退出")
+        console.print()
+
+        choice = console.input("[bold]请选择 > [/bold]").strip()
+
+        if choice == "0":
+            console.print("[cyan]再见！继续学习量化因子吧。[/cyan]")
+            break
+
+        elif choice == "1":
+            show_data_overview(data, day_idx)
+
+        elif choice == "2":
+            console.print()
+            console.print("[bold]可选因子:[/bold]")
+            for key, val in ALPHA_PRESETS.items():
+                console.print(f"  [{key}] {val['name']}: {val['expr']}")
+            console.print()
+
+            factor_choice = console.input("[bold]选择因子 > [/bold]").strip()
+
+            if factor_choice not in ALPHA_PRESETS:
+                console.print("[red]无效选择[/red]")
+                continue
+
+            preset = ALPHA_PRESETS[factor_choice]
+
+            if preset["compute"] is None:
+                console.print("[yellow]自定义因子模式 - 实验性功能[/yellow]")
+                console.print("输入因子表达式，例如: rank(returns)")
+                expr = console.input("[bold]表达式 > [/bold]").strip()
+                console.print(f"[dim]提示: 你输入的是 {expr}，本版本支持预设因子展示。[/dim]")
+                console.print("[dim]试试选择预设因子 1-5 来体验完整功能。[/dim]")
+                console.print()
+                continue
+
+            # 计算因子值
+            alpha_values = preset["compute"](data)
+
+            # 展示结果
+            show_alpha_signals(data, alpha_values, day_idx, factor_choice)
+
+            # 展示 step-by-step 计算过程
+            console.print("[bold cyan]--- 计算过程分解 ---[/bold cyan]")
+            console.print()
+
+            # 根据因子类型展示不同步骤
+            if factor_choice == "1":
+                console.print("Step 1: 计算日收益率 returns = (close_t - close_{t-1}) / close_{t-1}")
+                ret = calc_returns(data)
+                _show_mini_table(data, ret, day_idx, "returns")
+                console.print()
+                console.print("Step 2: 截面排名 rank(returns) - 同一天所有股票按收益率排名")
+                ranked = calc_rank(ret)
+                _show_mini_table(data, ranked, day_idx, "rank(returns)")
+                console.print()
+                console.print("Step 3: 取反 -1 * rank(returns) - 涨多的变负(做空)，跌多的变正(做多)")
+                console.print("[yellow]这就是最终信号！涨得越多 -> 因子越负 -> 做空[/yellow]")
+                console.print()
+
+            elif factor_choice == "4":
+                console.print("Step 1: 计算日收益率 returns")
+                ret = calc_returns(data)
+                _show_mini_table(data, ret, day_idx, "returns")
+                console.print()
+                console.print("Step 2: 时间序列排名 ts_rank(returns, 5)")
+                console.print("  每只股票的当前收益率在过去 5 天中的排名位置")
+                ts_r = calc_ts_rank(ret, 5)
+                _show_mini_table(data, ts_r, day_idx, "ts_rank")
+                console.print()
+                console.print("[yellow]排名接近 1 = 近 5 天收益最高（强势）[/yellow]")
+                console.print("[yellow]排名接近 0 = 近 5 天收益最低（弱势）[/yellow]")
+                console.print()
+
+            elif factor_choice == "5":
+                console.print("Step 1: 计算日收益率")
+                ret = calc_returns(data)
+                console.print("Step 2: 计算 10 日波动率")
+                std_ret = {}
+                for name, vals in ret.items():
+                    n = len(vals)
+                    out = np.zeros(n)
+                    for t in range(9, n):
+                        out[t] = np.std(vals[t - 9:t + 1])
+                    std_ret[name] = out
+                _show_mini_table(data, std_ret, day_idx, "10d_vol")
+                console.print()
+                console.print("Step 3: rank(returns) / rank(vol) + 0.1")
+                console.print("[yellow]收益率高且波动低的股票 -> 因子值大 -> 做多[/yellow]")
+                console.print()
+
+        elif choice == "3":
+            show_explanation()
+
+        elif choice == "4":
+            console.print(f"当前: 第 {day_idx + 1} 天")
+            new_day = console.input("输入天数 (1-20) > ").strip()
+            try:
+                d = int(new_day)
+                if 1 <= d <= 20:
+                    day_idx = d - 1
+                    console.print(f"[green]已切换到第 {day_idx + 1} 天[/green]")
+                else:
+                    console.print("[red]请输入 1-20 之间的数字[/red]")
+            except ValueError:
+                console.print("[red]无效输入[/red]")
+            console.print()
+
+
+def _show_mini_table(data, values_dict, day_idx, col_name):
+    """简化的数据表格"""
+    names = [s["name"] for s in data]
+    vals = [(name, values_dict[name][day_idx]) for name in names]
+    vals.sort(key=lambda x: x[1], reverse=True)
+
+    table = Table(box=box.SIMPLE)
+    table.add_column("股票", width=12)
+    table.add_column(col_name, justify="right", width=14)
+    for name, v in vals:
+        color = "red" if v > 0 else "green" if v < 0 else "dim"
+        table.add_row(name, f"[{color}]{v:+.4f}[/]" if v != 0 else f"[dim]{v:.4f}[/]")
+    console.print(table)
+
+
+if __name__ == "__main__":
+    main()
